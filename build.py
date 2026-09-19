@@ -6,7 +6,7 @@ import sys
 
 root = Path(__file__).resolve().parent
 command = [sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed',
-           '--name', 'PlaylistBatchAssistant', '--collect-all', 'mutagen']
+           '--name', 'PlaylistBatchAssistant', '--collect-all', 'mutagen', '--collect-all', 'playwright']
 conda_bin = Path(sys.base_prefix) / 'Library' / 'bin'
 if conda_bin.is_dir():
     os.environ['PATH'] = str(conda_bin) + os.pathsep + os.environ.get('PATH', '')

@@ -10,8 +10,25 @@ from audio_files import EXTENSIONS, MIN_BYTES, validate_audio
 from matching import safe_stem
 
 
+def publish_audio(temp, directory, track, extension):
+    stem = safe_stem(track.title, track.artist)
+    for i in range(1, 10000):
+        destination = directory / (stem + (f' ({i})' if i > 1 else '') + extension)
+        try:
+            if os.name == 'nt':
+                os.rename(temp, destination)
+            else:
+                os.link(temp, destination)
+            return destination
+        except FileExistsError:
+            continue
+    raise FileExistsError('同名文件过多')
+
+
 def audio_extension(header: bytes, url: str, content_type: str) -> str:
     # Website names all blobs .mp3. Prefer the actual signature over that label.
+    if header.lstrip(b'\xef\xbb\xbf \r\n\t').startswith((b'<', b'{', b'[')):
+        raise ValueError('网站返回网页/文本错误内容，不是音频；未保存为歌曲')
     if header.startswith(b'fLaC'):
         return '.flac'
     if header.startswith(b'RIFF') and header[8:12] == b'WAVE':
@@ -74,19 +91,6 @@ def download_audio(provider, candidate, track, directory: Path, checkpoint=lambd
         if candidate.duration and info.duration < candidate.duration * .9:
             raise ValueError('音频时长明显短于搜索结果，可能为试听片段')
         checkpoint()
-        stem = safe_stem(track.title, track.artist)
-        # Windows rename fails if a destination exists. POSIX hard links give
-        # the same atomic, no-overwrite behavior (rename would overwrite there).
-        for i in range(1, 10000):
-            destination = directory / (stem + (f' ({i})' if i > 1 else '') + extension)
-            try:
-                if os.name == 'nt':
-                    os.rename(temp, destination)
-                else:
-                    os.link(temp, destination)
-                return destination, info
-            except FileExistsError:
-                continue
-        raise FileExistsError('同名文件过多')
+        return publish_audio(temp, directory, track, extension), info
     finally:
         temp.unlink(missing_ok=True)

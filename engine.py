@@ -8,6 +8,7 @@ from audio_files import MIN_BYTES, scan_library, validate_audio
 from matching import compare, identity
 from downloader import download_audio
 from provider import JBSou, SOURCES
+from browser_provider import BrowserProvider, BrowserUnavailable
 
 
 class Cancelled(Exception):
@@ -29,7 +30,7 @@ class BatchWorker(threading.Thread):
         self.sources = sources or list(SOURCES.values())
         self.min_bytes = min_bytes
         self.interval = interval
-        self.provider = provider or JBSou()
+        self.provider = provider or BrowserProvider()
         self.scan_only = scan_only
         self.resume_event = threading.Event()
         self.resume_event.set()
@@ -38,6 +39,23 @@ class BatchWorker(threading.Thread):
         self.last_request = 0.0
         self.active_uid = None
         self.control_lock = threading.Lock()
+        self.focus_event = threading.Event()
+        self.current_step = ''
+        if hasattr(self.provider, 'bind'):
+            self.provider.bind(self.checkpoint, self.report)
+
+    def report(self, message):
+        self.current_step = message
+        self.emit('message', text=message)
+
+    def focus_browser(self):
+        self.focus_event.set()
+
+    def service_focus(self):
+        if self.focus_event.is_set():
+            self.focus_event.clear()
+            if hasattr(self.provider, 'focus'):
+                self.provider.focus()
 
     def emit(self, kind, **data):
         self.events.put(dict(kind=kind, **data))
@@ -59,12 +77,15 @@ class BatchWorker(threading.Thread):
 
     def checkpoint(self):
         while True:
+            self.service_focus()
             if self.cancel_event.is_set():
                 raise Cancelled()
             if self.skip_event.is_set():
                 raise Skipped()
             if self.resume_event.wait(.1):
                 return
+            if hasattr(self.provider, 'pump'):
+                self.provider.pump()
 
     def pace(self):
         while time.monotonic() - self.last_request < self.interval:
@@ -107,6 +128,9 @@ class BatchWorker(threading.Thread):
                 except Cancelled:
                     self.emit('status', uid=track.uid, status='待处理', note='已停止，可继续')
                     raise
+                except BrowserUnavailable as exc:
+                    self.emit('status', uid=track.uid, status='待处理', note=str(exc))
+                    raise
                 except Exception as exc:
                     self.emit('status', uid=track.uid, status='失败', note=str(exc))
                 finally:
@@ -119,6 +143,14 @@ class BatchWorker(threading.Thread):
             self.emit('message', text=f'任务错误：{exc}')
         finally:
             self.emit('done')
+            try:
+                if getattr(self.provider, 'keep_open', False) and self.provider.page:
+                    while not self.cancel_event.wait(.1) and not self.provider.page.is_closed():
+                        self.service_focus()
+                        self.provider.pump()
+            finally:
+                if hasattr(self.provider, 'close'):
+                    self.provider.close()
 
     def process(self, track, index):
         self.emit('status', uid=track.uid, status='搜索中', note='')
@@ -129,12 +161,18 @@ class BatchWorker(threading.Thread):
             queries = list(dict.fromkeys([track.query, track.title]))
             for query in queries:
                 self.pace()
+                self.report(f'音源 {source}：搜索「{query}」')
                 try:
                     candidates = self.provider.search(query, source)
+                except (Cancelled, Skipped, BrowserUnavailable):
+                    raise
                 except Exception as exc:
                     errors.append(f'{source}: {exc}')
+                    self.report(f'音源 {source} 搜索失败：{exc}')
                     break
                 self.checkpoint()
+                if not candidates:
+                    self.report(f'音源 {source} 未返回候选，尝试下一种搜索')
                 ranked = sorted([(compare(track.title, track.artist, c.title, c.artist), c)
                                  for c in candidates], key=lambda item: item[0].score, reverse=True)
                 for match, candidate in ranked:
@@ -149,12 +187,19 @@ class BatchWorker(threading.Thread):
                     self.emit('status', uid=track.uid, status='下载中', note=f'{source}: {candidate.title}')
                     self.pace()
                     try:
-                        path, info = download_audio(self.provider, candidate, track, self.destination,
-                                                    self.checkpoint, self.min_bytes)
-                    except (Cancelled, Skipped):
+                        if hasattr(self.provider, 'download'):
+                            path, info = self.provider.download(candidate, track, self.destination,
+                                                               self.checkpoint, self.min_bytes)
+                        else:
+                            path, info = download_audio(self.provider, candidate, track, self.destination,
+                                                        self.checkpoint, self.min_bytes)
+                    except (Cancelled, Skipped, BrowserUnavailable):
                         raise
                     except Exception as exc:
                         errors.append(f'{source}: {exc}')
+                        self.report(f'音源 {source} 下载未成功：{exc}')
+                        if hasattr(self.provider, 'download'):
+                            break
                         continue
                     index[identity(track.title, track.artist)] = path
                     self.emit('status', uid=track.uid, status='成功', note=str(path),

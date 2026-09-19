@@ -1,1 +1,2 @@
 mutagen==1.47.0
+playwright==1.61.0

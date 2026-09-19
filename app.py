@@ -8,9 +8,11 @@ import sys
 import tkinter as tk
 import webbrowser
 import uuid
+import time
 from dataclasses import replace
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
 from urllib.parse import urlencode
 
 from audio_files import MIN_BYTES, detect_directories
@@ -18,7 +20,7 @@ from engine import BatchWorker
 from playlist_parser import Track, parse_file, dedupe_tracks
 from provider import BASE_URL
 
-APP_NAME = '歌单批量下载助手 v2'
+APP_NAME = '歌单批量下载助手 v2.1 · 可见网页自动操作'
 
 
 class PlaylistApp(tk.Tk):
@@ -41,7 +43,9 @@ class PlaylistApp(tk.Tk):
         self.destination = tk.StringVar(value=str(Path.home() / 'Music' / 'PlaylistAssistant'))
         self.minimum = tk.StringVar(value=str(MIN_BYTES // 1024))
         self.stats = tk.StringVar(value='请导入 TXT / CSV 歌单')
-        self.message = tk.StringVar(value='先扫描本地音乐，再开始自动下载。')
+        self.message = tk.StringVar(value='点击开始后自动打开浏览器，输入、搜索、选歌并点击网页下载。')
+        self.step_started = time.monotonic()
+        self.step_text = ''
         self.current = tk.StringVar(value='当前：—')
         self.match = tk.StringVar(value='匹配：—')
         self.root_text = tk.StringVar(value='尚未选择本地音乐目录')
@@ -96,14 +100,14 @@ class PlaylistApp(tk.Tk):
         ttk.Label(self, textvariable=self.match, wraplength=1100).pack(anchor='w', padx=16, pady=6)
         actions = ttk.Frame(self, padding=(12, 5))
         actions.pack(fill='x')
-        self.start_button = ttk.Button(actions, text='开始自动下载', command=self.start)
+        self.start_button = ttk.Button(actions, text='开始网页自动下载', command=self.start)
         self.start_button.pack(side='left', padx=3)
         self.pause_button = ttk.Button(actions, text='暂停', command=self.pause)
         self.pause_button.pack(side='left', padx=3)
         ttk.Button(actions, text='跳过', command=self.skip).pack(side='left', padx=3)
         ttk.Button(actions, text='停止', command=self.stop).pack(side='left', padx=3)
-        ttk.Button(actions, text='打开当前页面', command=self.open_page).pack(side='left', padx=3)
-        ttk.Label(actions, text='模糊匹配仅供核对；版本与歌手一致才自动下载').pack(side='right')
+        ttk.Button(actions, text='显示自动浏览器', command=self.open_page).pack(side='left', padx=3)
+        ttk.Label(actions, text='自动操作浏览器；无需手动搜索或点下载').pack(side='right')
         frame = ttk.Frame(self, padding=12)
         frame.pack(fill='both', expand=True)
         columns = ('status', 'title', 'artist', 'note')
@@ -121,7 +125,30 @@ class PlaylistApp(tk.Tk):
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         self.tree.bind('<<TreeviewSelect>>', self.selection_changed)
+        self.log_box = ScrolledText(self, height=6, wrap='word', state='disabled', font=('Microsoft YaHei UI', 9))
+        self.log_box.pack(fill='x', padx=12, pady=(0, 6))
         ttk.Label(self, textvariable=self.message, wraplength=1120).pack(anchor='w', padx=16, pady=(0, 12))
+
+    def log(self, message):
+        self.step_started = time.monotonic()
+        self.step_text = message
+        self.message.set(message)
+        line = f'[{time.strftime("%H:%M:%S")}] {message}\n'
+        self.log_box.configure(state='normal')
+        self.log_box.insert('end', line)
+        if int(self.log_box.index('end-1c').split('.')[0]) > 500:
+            self.log_box.delete('1.0', '100.0')
+        self.log_box.see('end')
+        self.log_box.configure(state='disabled')
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            logfile = self.state_path.parent / 'runtime.log'
+            if logfile.exists() and logfile.stat().st_size > 5 * 1024 * 1024:
+                os.replace(logfile, logfile.with_suffix('.previous.log'))
+            with logfile.open('a', encoding='utf-8') as stream:
+                stream.write(line)
+        except OSError:
+            pass
 
     def selection_changed(self, _event=None):
         if not self.busy and self.tree.selection():
@@ -215,6 +242,12 @@ class PlaylistApp(tk.Tk):
     def start(self, scan_only=False):
         if self.busy:
             return
+        if self.worker and self.worker.is_alive():
+            self.worker.stop()
+            self.worker.join(2)
+            if self.worker.is_alive():
+                self.message.set('正在关闭上轮浏览器，请稍后再点击开始')
+                return
         if not self.tracks and not scan_only:
             self.message.set('请先导入歌单')
             return
@@ -238,6 +271,7 @@ class PlaylistApp(tk.Tk):
                                   Path(self.destination.get()).expanduser(), self.events,
                                   min_bytes=minimum, scan_only=scan_only)
         self.worker.start()
+        self.log('开始扫描本地文件' if scan_only else '开始网页自动流程：扫描 → 自动打开浏览器 → 搜索 → 点击下载 → 校验')
 
     def pause(self):
         if not self.busy or not self.worker:
@@ -258,7 +292,7 @@ class PlaylistApp(tk.Tk):
             self.autosave()
 
     def stop(self):
-        if self.worker and self.busy:
+        if self.worker and self.worker.is_alive():
             self.worker.stop()
             self.message.set('正在停止，请等待当前网络请求结束……')
 
@@ -272,9 +306,11 @@ class PlaylistApp(tk.Tk):
         self.autosave()
 
     def open_page(self):
-        track = self.by_uid(self.current_uid)
-        url = self.current_page or (BASE_URL + '?' + urlencode({'name': track.query, 'type': 'qq'}) if track else BASE_URL)
-        webbrowser.open(url)
+        if self.worker and self.worker.is_alive():
+            self.worker.focus_browser()
+            self.message.set('已请求显示程序正在操作的浏览器窗口')
+        else:
+            self.message.set('点击“开始网页自动下载”后会自动打开浏览器，无需手动打开网页')
 
     def poll(self):
         dirty = False
@@ -283,7 +319,7 @@ class PlaylistApp(tk.Tk):
                 evt = self.events.get_nowait()
                 kind = evt['kind']
                 if kind == 'message':
-                    self.message.set(evt['text'])
+                    self.log(evt['text'])
                 elif kind == 'scan':
                     self.message.set(f'本地有效音频 {evt["count"]} 个；扫描警告 {len(evt["warnings"])} 条')
                     try:
@@ -308,6 +344,8 @@ class PlaylistApp(tk.Tk):
                     if track:
                         track.status, track.note = evt['status'], evt['note']
                         self.tree.item(track.uid, values=(track.status, track.title, track.artist, track.note))
+                        if track.status in ('失败', '待确认', '成功'):
+                            self.log(f'{track.title} - {track.artist}：{track.status}；{track.note}')
                         dirty = True
                 elif kind == 'done':
                     self.busy = False
@@ -316,14 +354,23 @@ class PlaylistApp(tk.Tk):
                     self.pause_button.configure(text='暂停')
                     for button in self.mutable_buttons:
                         button.state(['!disabled'])
-                    self.message.set('本轮已结束；失败/待确认项可查看日志后重试')
+                    self.log('本轮已结束；请查看上方日志。浏览器保留供核对，停止或关闭程序时自动关闭。')
                     dirty = True
         except queue.Empty:
             pass
         if dirty:
             self.update_stats()
             self.autosave()
+        if self.busy and not self.paused and self.step_text:
+            elapsed = int(time.monotonic() - self.step_started)
+            if elapsed >= 5:
+                self.message.set(f'{self.step_text}（已等待 {elapsed} 秒）')
         if self.closing and not self.busy:
+            if self.worker and self.worker.is_alive():
+                self.worker.join(.2)
+                if self.worker.is_alive():
+                    self.after(100, self.poll)
+                    return
             self.autosave()
             self.destroy()
             return
@@ -396,14 +443,22 @@ class PlaylistApp(tk.Tk):
 
     def close(self):
         self.closing = True
+        if self.worker:
+            self.worker.stop()
         if self.busy:
             self.stop()
         else:
             self.autosave()
-            self.destroy()
+            if self.worker and self.worker.is_alive():
+                self.message.set('正在关闭自动浏览器……')
+            else:
+                self.destroy()
 
 
 if __name__ == '__main__':
+    if '--browser-self-test' in sys.argv:
+        from browser_selftest import main
+        raise SystemExit(main())
     if '--self-test' in sys.argv:
         from selftest import main
         raise SystemExit(main())
