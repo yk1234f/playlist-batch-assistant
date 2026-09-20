@@ -2,6 +2,15 @@
 
 Windows 桌面程序：导入 TXT / CSV 歌单，扫描本地音乐，双重去重，然后**自动打开可见浏览器，在网页上输入、搜索、选择匹配歌曲并点击下载按钮**，最后校验浏览器产生的文件。
 
+## tips
+exe自动下载音乐速度1分钟1-2首；
+手动下载网址：https://www.jbsou.cn/ ， 付费的音乐设置为不下载。
+歌单导出参考：https://playlistout.lengxiqwq.com/
+；Netease-Playlist-Exporter（相对复杂）
+
+<img width="1914" height="1012" alt="image" src="https://github.com/user-attachments/assets/f17735ea-8566-4612-984c-e6405d02eebb" />
+
+
 ## 使用
 
 支持 Windows 10/11 x64。EXE 不包含 Chromium 浏览器，也不会自动下载或安装浏览器。
