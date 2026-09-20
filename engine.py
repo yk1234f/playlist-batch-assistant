@@ -8,6 +8,7 @@ from audio_files import MIN_BYTES, scan_library, validate_audio
 from matching import compare, identity
 from downloader import download_audio
 from provider import JBSou, SOURCES
+from source_policy import search_plan
 from browser_provider import BrowserProvider, BrowserUnavailable
 
 
@@ -21,13 +22,16 @@ class Skipped(Exception):
 
 class BatchWorker(threading.Thread):
     def __init__(self, tracks, roots, destination, events, *, sources=None,
-                 min_bytes=MIN_BYTES, interval=2.0, provider=None, scan_only=False):
+                 min_bytes=MIN_BYTES, interval=2.0, provider=None, scan_only=False,
+                 retry_sources=(), sources_by_filename=False):
         super().__init__(daemon=True)
         self.tracks = tracks
         self.roots = list(dict.fromkeys([*roots, destination]))
         self.destination = destination
         self.events = events
-        self.sources = sources or list(SOURCES.values())
+        self.sources = list(SOURCES.values()) if sources is None else list(sources)
+        self.retry_sources = list(retry_sources)
+        self.sources_by_filename = sources_by_filename
         self.min_bytes = min_bytes
         self.interval = interval
         self.provider = provider or BrowserProvider()
@@ -156,57 +160,57 @@ class BatchWorker(threading.Thread):
         self.emit('status', uid=track.uid, status='搜索中', note='')
         best = None
         errors = []
-        attempted = False
-        for source in self.sources:
-            queries = list(dict.fromkeys([track.query, track.title]))
-            for query in queries:
+        plan = search_plan(track, self.sources, self.retry_sources, self.sources_by_filename)
+        if not plan:
+            self.emit('status', uid=track.uid, status='待确认', note='没有可用音源，请勾选音源或修改歌单文件名')
+            return
+        for source, query, round_number in plan:
+            self.pace()
+            self.emit('source', uid=track.uid, source=source, round=round_number)
+            self.report(f'音源 {source} 第 {round_number} 次：搜索「{query}」')
+            try:
+                candidates = self.provider.search(query, source)
+            except (Cancelled, Skipped, BrowserUnavailable):
+                raise
+            except Exception as exc:
+                errors.append(f'{source}: {exc}')
+                self.report(f'音源 {source} 搜索失败：{exc}')
+                continue
+            self.checkpoint()
+            if not candidates:
+                self.report(f'音源 {source} 没有候选，按已勾选策略继续')
+            ranked = sorted([(compare(track.title, track.artist, c.title, c.artist), c)
+                             for c in candidates], key=lambda item: item[0].score, reverse=True)
+            for match, candidate in ranked:
+                if best is None or match.score > best[0].score:
+                    best = match, candidate
+                    self.emit('match', uid=track.uid, title=match.title, artist=match.artist,
+                              version=match.version, candidate=f'{candidate.title} - {candidate.artist}',
+                              page=candidate.page_url)
+                if not match.automatic:
+                    continue
+                self.report(f'已找到精确匹配，停止其他音源和二次搜索：{source}')
+                self.emit('status', uid=track.uid, status='下载中', note=f'{source}: {candidate.title}')
                 self.pace()
-                self.report(f'音源 {source}：搜索「{query}」')
                 try:
-                    candidates = self.provider.search(query, source)
+                    if hasattr(self.provider, 'download'):
+                        path, info = self.provider.download(candidate, track, self.destination,
+                                                           self.checkpoint, self.min_bytes)
+                    else:
+                        path, info = download_audio(self.provider, candidate, track, self.destination,
+                                                    self.checkpoint, self.min_bytes)
                 except (Cancelled, Skipped, BrowserUnavailable):
                     raise
                 except Exception as exc:
-                    errors.append(f'{source}: {exc}')
-                    self.report(f'音源 {source} 搜索失败：{exc}')
-                    break
-                self.checkpoint()
-                if not candidates:
-                    self.report(f'音源 {source} 未返回候选，尝试下一种搜索')
-                ranked = sorted([(compare(track.title, track.artist, c.title, c.artist), c)
-                                 for c in candidates], key=lambda item: item[0].score, reverse=True)
-                for match, candidate in ranked:
-                    if best is None or match.score > best[0].score:
-                        best = match, candidate
-                        self.emit('match', uid=track.uid, title=match.title, artist=match.artist,
-                                  version=match.version, candidate=f'{candidate.title} - {candidate.artist}',
-                                  page=candidate.page_url)
-                    if not match.automatic:
-                        continue
-                    attempted = True
-                    self.emit('status', uid=track.uid, status='下载中', note=f'{source}: {candidate.title}')
-                    self.pace()
-                    try:
-                        if hasattr(self.provider, 'download'):
-                            path, info = self.provider.download(candidate, track, self.destination,
-                                                               self.checkpoint, self.min_bytes)
-                        else:
-                            path, info = download_audio(self.provider, candidate, track, self.destination,
-                                                        self.checkpoint, self.min_bytes)
-                    except (Cancelled, Skipped, BrowserUnavailable):
-                        raise
-                    except Exception as exc:
-                        errors.append(f'{source}: {exc}')
-                        self.report(f'音源 {source} 下载未成功：{exc}')
-                        if hasattr(self.provider, 'download'):
-                            break
-                        continue
-                    index[identity(track.title, track.artist)] = path
-                    self.emit('status', uid=track.uid, status='成功', note=str(path),
-                              duration=info.duration, size=info.size)
+                    self.emit('status', uid=track.uid, status='失败',
+                              note=f'{source} 搜索已匹配，但下载失败：{exc}；本首停止搜索，可更换音源后重试')
                     return
-        status = '待确认' if best and not attempted else '失败'
-        note = '候选歌名/歌手/版本不完全一致，请打开页面核对' if status == '待确认' else '未找到可校验通过的匹配音频'
+                index[identity(track.title, track.artist)] = path
+                self.emit('status', uid=track.uid, status='成功', note=str(path),
+                          duration=info.duration, size=info.size)
+                return
+        status = '待确认' if best else '失败'
+        note = '候选歌名/歌手/版本不完全一致，请核对' if best else '所选音源未找到匹配歌曲'
         if errors:
             note += '；' + '；'.join(errors)[-1500:]
         self.emit('status', uid=track.uid, status=status, note=note)

@@ -20,3 +20,5 @@ session*.json
 *.wma
 test-results/
 local_scan.py
+/PlaylistBatchAssistant.exe
+/启动新版.bat

@@ -22,7 +22,7 @@ jobs:
         shell: pwsh
         run: |
           $env:PLAYLIST_TEST_REPORT = "$pwd/packaged-test.txt"
-          $process = Start-Process -FilePath ./dist/PlaylistBatchAssistant/PlaylistBatchAssistant.exe -ArgumentList '--self-test' -PassThru -Wait -WindowStyle Hidden
+          $process = Start-Process -FilePath ./dist/PlaylistBatchAssistant.exe -ArgumentList '--self-test' -PassThru -Wait -WindowStyle Hidden
           Get-Content $env:PLAYLIST_TEST_REPORT
           if ($process.ExitCode -ne 0) { exit 1 }
       - name: Test packaged browser flow
@@ -30,10 +30,10 @@ jobs:
         run: |
           $env:PLAYLIST_BROWSER_HEADLESS = '1'
           $env:PLAYLIST_BROWSER_REPORT = "$pwd/packaged-browser-test.txt"
-          $process = Start-Process -FilePath ./dist/PlaylistBatchAssistant/PlaylistBatchAssistant.exe -ArgumentList '--browser-self-test' -PassThru -Wait -WindowStyle Hidden
+          $process = Start-Process -FilePath ./dist/PlaylistBatchAssistant.exe -ArgumentList '--browser-self-test' -PassThru -Wait -WindowStyle Hidden
           Get-Content $env:PLAYLIST_BROWSER_REPORT
           if ($process.ExitCode -ne 0) { exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: PlaylistBatchAssistant-Windows
-          path: dist/PlaylistBatchAssistant/
+          path: dist/PlaylistBatchAssistant.exe

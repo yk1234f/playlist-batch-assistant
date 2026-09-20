@@ -20,6 +20,7 @@ from engine import BatchWorker
 from matching import compare, identity, safe_stem
 from playlist_parser import Track, parse_file, dedupe_tracks
 from provider import JBSou, Candidate, ProviderError
+from policy_selftest import PolicyRegression
 
 
 def wav_bytes():
@@ -316,6 +317,43 @@ class Regression(unittest.TestCase):
         self.assertTrue(any(e.get('uid') == 'one' and e.get('status') == '跳过' for e in events.queue))
         self.assertTrue(any(e.get('uid') == 'two' and e.get('status') == '成功' for e in events.queue))
 
+    def test_tk_playlist_editor_crud_and_sync(self):
+        from app import PlaylistApp
+        from playlist_editor import PlaylistEditor
+        from unittest.mock import patch
+        app = PlaylistApp(state_path=self.root / 'editor-session.json')
+        app.withdraw()
+        editor = PlaylistEditor(app, self.root, app.playlist_saved)
+        editor.withdraw()
+        try:
+            path = self.root / 'QQ-test.txt'
+            editor.load(path)
+            editor.title_value.set('初始歌曲')
+            editor.artist_value.set('测试歌手')
+            editor.add()
+            editor.tree.selection_set('1')
+            editor.title_value.set('修改歌曲 (Live)')
+            editor.update()
+            editor.query.set('不存在')
+            self.assertEqual(len(editor.tree.get_children()), 0)
+            editor.query.set('Live')
+            self.assertEqual(len(editor.tree.get_children()), 1)
+            with patch('playlist_editor.messagebox.showinfo'):
+                editor.save()
+            self.assertEqual(app.tracks[0].title, '修改歌曲 (Live)')
+            self.assertEqual(parse_file(path)[0].artist, '测试歌手')
+            editor.tree.selection_set('1')
+            editor.delete()
+            with patch('playlist_editor.messagebox.showinfo'):
+                editor.save()
+            self.assertEqual(app.tracks, [])
+            self.assertTrue(list(self.root.glob('QQ-test.txt.before-edit-*.bak')))
+        finally:
+            editor.destroy()
+            for job in app.tk.splitlist(app.tk.call('after', 'info')):
+                app.after_cancel(job)
+            app.destroy()
+
     def test_tk_session_and_controls(self):
         from app import PlaylistApp
         app = PlaylistApp(state_path=self.root / 'session.json')
@@ -340,6 +378,18 @@ class Regression(unittest.TestCase):
             app.poll()
             self.assertIn('100%', app.match.get())
             self.assertEqual(app.current_page, self.url)
+            app.tree.selection_set(app.tracks[0].uid)
+            app.track_source.set('酷狗')
+            app.set_track_source()
+            self.assertEqual(app.tracks[0].music_source, 'kugou')
+            self.assertIn('酷狗', app.tree.item(app.tracks[0].uid, 'values')[1])
+            app.retry_vars['qq'].set(True)
+            app.by_filename.set(True)
+            app.autosave()
+            app._load(app.state_path)
+            self.assertTrue(app.retry_vars['qq'].get())
+            self.assertTrue(app.by_filename.get())
+            self.assertEqual(app.tracks[0].music_source, 'kugou')
         finally:
             for job in app.tk.splitlist(app.tk.call('after', 'info')):
                 app.after_cancel(job)
@@ -350,7 +400,9 @@ def main():
     output = Path(os.environ.get('PLAYLIST_TEST_REPORT', str(Path(tempfile.gettempdir()) / 'playlist-assistant-selftest.txt')))
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open('w', encoding='utf-8') as stream:
-        result = unittest.TextTestRunner(stream=stream, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Regression))
+        suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(Regression),
+                                    unittest.defaultTestLoader.loadTestsFromTestCase(PolicyRegression)])
+        result = unittest.TextTestRunner(stream=stream, verbosity=2).run(suite)
     if getattr(__import__('sys'), 'stdout', None):
         print(output.read_text(encoding='utf-8'))
         print(f'Report: {output}')

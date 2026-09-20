@@ -1,19 +1,34 @@
-# 歌单批量下载助手 v2.1 · 可见网页自动操作
+# 歌单批量下载助手 v2.2 · 音源选择与 TXT 管理
 
 Windows 桌面程序：导入 TXT / CSV 歌单，扫描本地音乐，双重去重，然后**自动打开可见浏览器，在网页上输入、搜索、选择匹配歌曲并点击下载按钮**，最后校验浏览器产生的文件。
 
 ## 使用
 
-从 GitHub Releases 下载 `PlaylistBatchAssistant-Windows.zip`，**解压整个文件夹**，双击 `PlaylistBatchAssistant.exe`。不需要安装 Python 或浏览器插件；电脑需已安装 **Chrome 或 Edge**。程序使用独立浏览器资料目录，不接管日常浏览器标签。
+从 GitHub Releases 直接下载 **`PlaylistBatchAssistant.exe`**，双击运行，无需解压或配套文件夹。不需要安装 Python 或浏览器插件；电脑需已安装 **Chrome 或 Edge**。程序使用独立浏览器资料目录，不接管日常浏览器标签。单文件 EXE 首次启动需要解包运行组件，可能稍有等待。
 
 1. **导入歌单**：支持多个 TXT / CSV；TXT 格式是 `歌名 - 歌手`，PlaylistOut 格式为 `歌名 - 歌手 - 专辑`；CSV 至少有 `title,artist` 或 `歌名,歌手` 两列。
 2. **自动识别**：识别 Windows 的音乐、下载目录（包括系统重定向目录）。其他磁盘或自定义文件夹，用 **选择目录** 多次添加。不会自动遍历所有硬盘。
 3. **选择下载目录**，点 **重新扫描**。下载目录始终参与去重；本地文件优先读取音频标签，无标签时识别 `歌名 - 歌手` 和 `歌手 - 歌名` 文件名。
-4. 点 **开始网页自动下载**。浏览器自动出现；能看到文字逐字输入、音源切换、Get 搜索、候选选择和下载按钮点击。顺序尝试网易、QQ、酷狗、酷我、咪咕。每个音源先搜歌名加歌手，再尝试只搜歌名。
+4. 勾选需要的音源，点 **开始网页自动下载**。浏览器自动出现；能看到文字逐字输入、音源切换、Get 搜索、候选选择和下载按钮点击。按界面从左至右尝试已选音源，每个音源默认只搜一次；精确匹配后立即停止搜索其他音源。
 5. 可以 **暂停 / 继续**、**跳过**、**停止**，或点 **显示自动浏览器**把正在操作的同一个窗口带到前台。**不需要手动打开页面、输入或点下载**。请不要在执行期间手动切换这个专用窗口里的歌曲。
 6. 下方运行日志显示每一步、等待时间、网站提示和失败原因；点击 **重试失败 / 待确认** 会把失败、待确认和手动跳过项重新排队。
 
 原项目的 `playlists` 文件夹保留在本地，可直接从中导入；仓库与发行包不包含个人歌单、歌曲或登录凭据。
+
+## 音源显示与修改
+
+- **启用音源**：勾选网易、QQ、酷狗、酷我、咪咕中的任意组合。默认全选。
+- **查找失败后二次搜索**：各音源独立勾选，默认全部关闭。只有第一轮所有所选音源均未精确匹配，才对勾选的音源用“仅歌名”再搜一次。
+- **按 TXT 文件名识别音源**：例如 `网易收藏.txt`、`QQ歌单.txt`；未识别时使用全局勾选。支持网易/QQ/酷狗/酷我/咪咕及对应英文名。
+- 列表的 **音源 / 策略** 列显示每首歌将使用的音源。选中歌曲，在 **所选歌曲音源** 下拉框点击修改；选择“自动（按规则）”恢复自动策略。运行时显示 **当前音源及搜索轮次**。
+- 优先级：**单首手动指定 > 文件名识别 > 全局勾选**。设置自动保存。修改失败/待确认歌曲的音源会将其重新排队；运行期间需先停止才能修改。
+- 找到精确匹配后，即使下载失败也不再搜索其他音源。失败原因保留在列表，可手动换源重试。
+
+## TXT 歌单增删改查
+
+点 **管理 TXT 歌单**，打开 `playlists` 中的 TXT 或新建 TXT，可按歌名/歌手查找、新增、修改和删除歌曲。点击 **保存 TXT 并同步任务** 后写回文件，并自动更新下载任务。也可用文本编辑器修改文件，再点 **从 TXT 重新同步**。
+
+未改动歌曲保留任务状态与手动音源；新歌、改名或改歌手的歌曲重新排队；从所有已导入歌单删除的歌曲移除任务。删除任务不会删除本地音乐。保存前自动产生 `.before-edit-*.bak`，保留原文件编码、换行、专辑与标记；如果 TXT 被外部修改，拒绝覆盖并提示重新打开。TXT 的歌曲行格式仍是 `歌名 - 歌手`（可加 ` - 专辑`）；音源设置保存在会话中。
 
 ## 匹配与去重
 
@@ -72,13 +87,13 @@ EXE 内置相同离线回归测试（自动生成 12 秒静音 WAV，启动本�
 
 ```powershell
 $env:PLAYLIST_TEST_REPORT = "$pwd\packaged-test.txt"
-$p = Start-Process .\dist\PlaylistBatchAssistant\PlaylistBatchAssistant.exe -ArgumentList '--self-test' -PassThru -Wait -WindowStyle Hidden
+$p = Start-Process .\dist\PlaylistBatchAssistant.exe -ArgumentList '--self-test' -PassThru -Wait -WindowStyle Hidden
 Get-Content $env:PLAYLIST_TEST_REPORT
 $p.ExitCode
 
 # 可见浏览器集成测试（需要 Chrome / Edge，5 项）
 $env:PLAYLIST_BROWSER_REPORT = "$pwd\packaged-browser-test.txt"
-$p = Start-Process .\dist\PlaylistBatchAssistant\PlaylistBatchAssistant.exe -ArgumentList '--browser-self-test' -PassThru -Wait -WindowStyle Hidden
+$p = Start-Process .\dist\PlaylistBatchAssistant.exe -ArgumentList '--browser-self-test' -PassThru -Wait -WindowStyle Hidden
 Get-Content $env:PLAYLIST_BROWSER_REPORT
 $p.ExitCode
 ```
@@ -87,4 +102,4 @@ $p.ExitCode
 
 ## 模块
 
-`playlist_parser.py` 歌单解析；`matching.py` 匹配；`audio_files.py` 本地扫描和校验；`browser_provider.py` 可见浏览器操作；`downloader.py` 文件发布及旧接口下载；`engine.py` 队列；`app.py` 桌面界面；`selftest.py` 基础回归；`browser_selftest.py` 真实浏览器集成测试。`provider.py` 仅保留供旧接口回归，GUI 默认使用可见浏览器。
+`playlist_parser.py` 歌单解析；`playlist_document.py` TXT 编辑与任务同步；`playlist_editor.py` 编辑窗口；`source_policy.py` 音源与重试策略；`matching.py` 匹配；`audio_files.py` 本地扫描和校验；`browser_provider.py` 可见浏览器操作；`downloader.py` 文件发布及旧接口下载；`engine.py` 队列；`app.py` 桌面界面；`selftest.py` / `policy_selftest.py` 回归；`browser_selftest.py` 真实浏览器集成测试。`provider.py` 仅保留供旧接口回归，GUI 默认使用可见浏览器。

@@ -24,6 +24,8 @@ class Track:
     source_line: int = 0
     status: str = "待处理"
     note: str = ""
+    source_path: str = ""
+    music_source: str = ""
 
     @property
     def query(self) -> str:
@@ -62,7 +64,10 @@ def _extract_flags(*values: str) -> Tuple[str, list[str]]:
 
 
 def parse_txt(path: Path) -> List[Track]:
-    text = read_text_safely(path)
+    return parse_txt_text(read_text_safely(path), path)
+
+
+def parse_txt_text(text: str, path: Path) -> List[Track]:
     lines = text.splitlines()
     preview = "\n".join(lines[:20])
     is_playlistout = "PlaylistOut" in preview or "歌曲总数:" in preview or "歌单名称:" in preview
@@ -101,6 +106,7 @@ def parse_txt(path: Path) -> List[Track]:
                 album=album,
                 flags=flags,
                 source_file=path.name,
+                source_path=str(path.resolve()),
                 source_line=lineno,
             )
         )
@@ -137,6 +143,7 @@ def parse_csv(path: Path) -> List[Track]:
                 album=album,
                 flags=flags,
                 source_file=path.name,
+                source_path=str(path.resolve()),
                 source_line=idx,
             )
         )

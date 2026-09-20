@@ -1,14 +1,16 @@
 # 验证记录
 
-日期：2026-09-20，v2.1。环境：Windows 11 / Python 3.13.12 / Mutagen 1.47.0 / Playwright 1.61.0 / PyInstaller 6.22.3。
+日期：2026-09-20，v2.2。环境：Windows 11 / Python 3.13.12 / Mutagen 1.47.0 / Playwright 1.61.0 / PyInstaller 6.22.3。
 
 | 层级 | 结果 | 边界 |
 | --- | --- | --- |
-| 源码离线回归 | 34 / 34 通过 | 自动生成测试音频与本地 HTTP 服务 |
-| 最终 Windows EXE 回归 | 34 / 34 通过，退出码 0 | 正常 Windows 权限环境；并非只验证构建成功 |
-| 源码浏览器集成 | 5 / 5 通过 | 真实可见 Chrome、真实输入/DOM 点击/Blob 下载；本地合成音频 |
+| 源码离线回归 | 51 / 51 通过 | 自动生成测试音频与本地 HTTP 服务 |
+| 最终 Windows EXE 回归 | 51 / 51 通过，退出码 0 | EXE 单独复制到空目录；不依赖相邻源码或 _internal 文件夹 |
+| 源码浏览器集成 | 5 / 5 通过 | 真实 Chrome 无头模式、真实输入/DOM 点击/Blob 下载；本地合成音频 |
 | 最终 EXE 浏览器集成 | 5 / 5 通过，退出码 0 | 打包后的 Playwright 与浏览器下载也实际运行验证 |
-| Tk 界面程序测试 | 通过 | 窗口/控件初始化、会话读写、表格与匹配显示；未进行人工逐像素验收 |
+| Tk 界面程序测试 | 通过 | 音源列、单首音源修改与设置持久化、TXT 编辑器增删改查保存和任务同步；未进行人工逐像素验收 |
+| 搜索策略 | 通过 | 默认一次、匹配即停、下载失败不继续搜索、仅勾选音源二次搜索、文件名推断、单首覆盖优先级 |
+| TXT 文件安全 | 通过 | 保留 BOM/GB18030/换行/专辑/标记，保存备份，拒绝覆盖外部修改；歌曲删除不操作音乐文件 |
 | 双重去重 | 通过 | 歌单去重、本地目录交叠、下载后再次扫描去重、缺失成功文件重新排队 |
 | 版本匹配 | 通过 | Live/Live版、录音室、Remix、速度标记、完整歌手集合、相似歌名不自动下载 |
 | 下载校验 | 通过 | 假 HTML、假 ID3、错误 MIME、长度不符、过小文件、WAV 截断均失败且不留正式文件 |
@@ -16,8 +18,8 @@
 | 真实网站网页操作 | 通过 | 可见窗口输入“寓言 张韶涵”、Get 搜索、10 条候选、选歌、点击下载、产生浏览器下载 |
 | 网站真实音频成功保存 | **未通过** | 网页按钮返回脚本与“获取失败”文字，不是音频；正确拒绝保存 |
 
-本地发布测试报告保存在项目 `test-results/source-test-2.1.txt`、`test-results/browser-source.txt`、`test-results/packaged-test-2.1.txt` 与 `test-results/packaged-browser-2.1.txt`。目录中可能包含个人歌单、扫描结果和浏览器测试资料，因此整个目录不提交 GitHub。回归命令与合成测试数据生成方法包含在 `selftest.py` 与 `browser_selftest.py`。
+本地发布测试报告保存在项目 `test-results/source-test-2.2.txt`、`test-results/browser-source-2.2.txt`、`test-results/packaged-test-2.2.txt` 与 `test-results/packaged-browser-2.2.txt`。目录中可能包含个人歌单、扫描结果和浏览器测试资料，因此整个目录不提交 GitHub。回归命令与合成测试数据生成方法包含在 `selftest.py`、`policy_selftest.py` 与 `browser_selftest.py`。
 
-首轮打包发现 Conda DLL 搜索路径不完整，已由 `build.py` 显式补全 Tcl/Tk 等 DLL 后重打包。受限沙箱中的 Tcl 初始化测试仍受文件访问限制，正常 Windows 环境下最终 34 项测试通过。
+`build.py` 使用 PyInstaller onefile，显式补全 Conda Tcl/Tk DLL。最终单文件 EXE 大小为 53,143,943 字节，已在正常 Windows 权限环境下完成 51 项基础/策略/GUI 回归和 5 项浏览器集成回归。浏览器测试使用本地合成音频，真实网站的可见操作证据来自同日 v2.1 实测，v2.2 没有把网站音源失败标为修复。
 
 发行包不包含个人歌单、本地音乐、浏览器资料、网站响应样本或凭据。当前版本为预发布版，不能据离线通过推断网站音源随时可用。
