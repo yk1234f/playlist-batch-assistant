@@ -120,7 +120,7 @@ class Regression(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.provider = JBSou(self.url, timeout=2)
         self.track = Track('one', '测试 (Live)', '歌手')
 
