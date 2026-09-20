@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import os
 import struct
+import math
 from pathlib import Path
 from dataclasses import dataclass
 import mutagen
 
 EXTENSIONS = {'.mp3', '.flac', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.ape', '.wma', '.aiff', '.aif'}
 MIN_BYTES = 256 * 1024
-MIN_SECONDS = 10.0
+MIN_SECONDS = 90.0
+
+
+class ShortAudioError(ValueError):
+    def __init__(self, duration, minimum=MIN_SECONDS):
+        self.duration = duration
+        self.minimum = minimum
+        super().__init__(f'时长不足：{duration:.3f} 秒 < {minimum:g} 秒；不保存/不下载')
 
 
 @dataclass
@@ -24,8 +32,6 @@ def validate_audio(path: Path, min_bytes: int = MIN_BYTES, extension: str | None
     if suffix not in EXTENSIONS:
         raise ValueError('不是支持的音频扩展名')
     size = path.stat().st_size
-    if size < min_bytes:
-        raise ValueError(f'文件太小：{size} 字节，要求至少 {min_bytes} 字节')
     mime = content_type.split(';')[0].strip().lower()
     if mime.startswith('text/') or any(x in mime for x in ('json', 'html', 'xml')):
         raise ValueError('服务器返回文本/HTML/JSON，而非音频')
@@ -48,12 +54,16 @@ def validate_audio(path: Path, min_bytes: int = MIN_BYTES, extension: str | None
         raise ValueError('音频文件头与扩展名不符')
     audio = mutagen.File(path)
     duration = float(getattr(getattr(audio, 'info', None), 'length', 0))
-    if audio is None or duration < min_seconds:
-        raise ValueError('无法解析音频或时长不足（可能为截断文件/试听片段）')
+    if audio is None or not math.isfinite(duration) or duration <= 0:
+        raise ValueError('无法可靠解析音频时长')
     if suffix == '.wav':
         expected = struct.unpack('<I', header[4:8])[0] + 8
         if size < expected:
             raise ValueError('WAV 文件被截断')
+    if duration < min_seconds:
+        raise ShortAudioError(duration, min_seconds)
+    if size < min_bytes:
+        raise ValueError(f'文件太小：{size} 字节，要求至少 {min_bytes} 字节')
     return AudioInfo(suffix, duration, size)
 
 
@@ -124,7 +134,7 @@ def repair_tag(value: str) -> str:
     return max(candidates, key=cjk_count)
 
 
-def scan_library(roots: list[Path], min_bytes: int = MIN_BYTES, checkpoint=lambda: None):
+def scan_library(roots: list[Path], min_bytes: int = MIN_BYTES, checkpoint=lambda: None, short_index=None):
     from matching import identity
     index: dict[tuple, Path] = {}
     errors: list[str] = []
@@ -147,6 +157,12 @@ def scan_library(roots: list[Path], min_bytes: int = MIN_BYTES, checkpoint=lambd
                     continue
                 seen.add(resolved)
                 try:
+                    if short_index is not None:
+                        info = validate_audio(path, min_bytes=1, min_seconds=.001)
+                        if info.duration < MIN_SECONDS:
+                            for title, artist in file_identity(path):
+                                short_index.setdefault(identity(title, artist), (path, info.duration))
+                            continue
                     validate_audio(path, min_bytes)
                     for title, artist in file_identity(path):
                         index.setdefault(identity(title, artist), path)

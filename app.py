@@ -17,13 +17,16 @@ from urllib.parse import urlencode
 
 from audio_files import MIN_BYTES, detect_directories
 from engine import BatchWorker
+from browser_runtime import BROWSER_OPTIONS
 from playlist_parser import Track, parse_file, dedupe_tracks
 from provider import BASE_URL, SOURCES
 from source_policy import selected_for
 from playlist_document import sync_playlists
 from playlist_editor import PlaylistEditor
+from duplicate_dialog import DuplicateDialog
+from short_audio import mark_deleted_short
 
-APP_NAME = '歌单批量下载助手 v2.2 · 音源策略 / TXT 歌单管理'
+APP_NAME = '歌单批量下载助手 v2.4 · 浏览器启动提示'
 
 
 class PlaylistApp(tk.Tk):
@@ -39,6 +42,8 @@ class PlaylistApp(tk.Tk):
         self.by_filename = tk.BooleanVar(value=False)
         self.track_source = tk.StringVar(value='自动（按规则）')
         self.active_source = tk.StringVar(value='当前音源：—')
+        self.browser_choice = tk.StringVar(value=next(iter(BROWSER_OPTIONS)))
+        self.browser_status = tk.StringVar(value='浏览器：尚未启动（需要已安装 Edge 或 Chrome）')
         self.duplicates = 0
         self.roots = []
         self.current_uid = None
@@ -87,10 +92,18 @@ class PlaylistApp(tk.Tk):
         bar = ttk.Frame(settings)
         bar.pack(fill='x')
         for label, callback in [('自动识别', self.detect), ('选择目录', self.choose_root),
-                                ('清除扫描目录', self.clear_roots), ('重新扫描', lambda: self.start(True))]:
+                                ('清除扫描目录', self.clear_roots), ('重新扫描', lambda: self.start(True)),
+                                ('文件去重 / 删除重复', lambda: DuplicateDialog(self))]:
             button = ttk.Button(bar, text=label, command=callback)
             button.pack(side='left', padx=3)
             self.mutable_buttons.append(button)
+        ttk.Label(bar, text='注意：去重删除会删除文件', foreground='#a02020').pack(side='left', padx=8)
+        short_bar = ttk.Frame(settings)
+        short_bar.pack(fill='x', pady=(5,0))
+        short_button = ttk.Button(short_bar, text='删除短音频（<90秒）', command=lambda: DuplicateDialog(self, short=True))
+        short_button.pack(side='left', padx=3)
+        self.mutable_buttons.append(short_button)
+        ttk.Label(short_bar, text='会删除文件；不足 90 秒不保存并标记“时长不足”，90 秒整及以上保留。', foreground='#a02020').pack(side='left')
         ttk.Label(settings, textvariable=self.root_text, wraplength=1080).pack(anchor='w', pady=8)
         row = ttk.Frame(settings)
         row.pack(fill='x')
@@ -105,6 +118,15 @@ class PlaylistApp(tk.Tk):
         minimum = ttk.Entry(row, textvariable=self.minimum, width=8)
         minimum.pack(side='left')
         self.mutable_buttons.append(minimum)
+        browser_row = ttk.Frame(self, padding=(12, 6))
+        browser_row.pack(fill='x')
+        ttk.Label(browser_row, text='自动操作浏览器：').pack(side='left')
+        browser_combo = ttk.Combobox(browser_row, textvariable=self.browser_choice,
+                                     values=list(BROWSER_OPTIONS), state='readonly', width=24)
+        browser_combo.pack(side='left')
+        browser_combo.bind('<<ComboboxSelected>>', lambda event: self.autosave())
+        self.mutable_buttons.append(browser_combo)
+        ttk.Label(browser_row, textvariable=self.browser_status).pack(side='left', padx=10)
         policy = ttk.LabelFrame(self, text='搜索音源（从左至右；精确匹配即停止搜索）', padding=6)
         policy.pack(fill='x', padx=12, pady=5)
         ttk.Label(policy, text='启用音源').grid(row=0, column=0, sticky='w')
@@ -118,6 +140,7 @@ class PlaylistApp(tk.Tk):
                                 variable=self.by_filename, command=self.policy_changed)
         infer.grid(row=2, column=0, columnspan=6, sticky='w')
         self.mutable_buttons.append(infer)
+        ttk.Label(policy, text='下载返回错误内容时，当前歌曲自动重试 2 次（3 秒 / 6 秒）；与“二次搜索”独立，不重搜其他音源。').grid(row=3, column=0, columnspan=6, sticky='w')
         ttk.Label(self, textvariable=self.stats, font=('Microsoft YaHei UI', 11, 'bold'), wraplength=1120).pack(anchor='w', padx=16, pady=12)
         ttk.Label(self, textvariable=self.current, wraplength=1100).pack(anchor='w', padx=16)
         ttk.Label(self, textvariable=self.active_source, font=('Microsoft YaHei UI', 10, 'bold')).pack(anchor='w', padx=16)
@@ -216,7 +239,7 @@ class PlaylistApp(tk.Tk):
         track = self.by_uid(self.tree.selection()[0])
         if track:
             track.music_source = SOURCES.get(self.track_source.get(), '')
-            if track.status in ('失败', '待确认'):
+            if track.status in ('失败', '待确认', '时长不足'):
                 track.status, track.note = '待处理', ''
             self.tree.item(track.uid, values=self.row_values(track))
             self.update_stats()
@@ -237,7 +260,7 @@ class PlaylistApp(tk.Tk):
         self.stats.set(f'歌单歌曲：{len(self.tracks) + self.duplicates}    歌单内部重复：{self.duplicates}    '
                        f'本地已有：{counts.get("本地已有", 0)}    待下载：{pending}    '
                        f'下载成功：{counts.get("成功", 0)}    失败：{counts.get("失败", 0)}    '
-                       f'待确认：{counts.get("待确认", 0)}    跳过：{counts.get("跳过", 0)}')
+                       f'待确认：{counts.get("待确认", 0)}    时长不足：{counts.get("时长不足", 0)}    跳过：{counts.get("跳过", 0)}')
 
     def import_files(self):
         if self.busy:
@@ -279,10 +302,12 @@ class PlaylistApp(tk.Tk):
                 raise
             return
         self.tracks, self.duplicates = tracks, duplicates
+        mark_deleted_short(self.tracks, self.state_path.parent)
         self.current_uid = None
         self.refresh()
         self.autosave()
         self.message.set(f'已从 {len(self.playlist_paths)} 个歌单同步 {len(tracks)} 个任务；重复 {duplicates} 首')
+        self.start(True)
 
     def clear(self):
         if self.busy or not messagebox.askyesno('清空歌单', '清空处理列表？本地音乐文件不会删除。'):
@@ -360,7 +385,8 @@ class PlaylistApp(tk.Tk):
                                   Path(self.destination.get()).expanduser(), self.events,
                                   min_bytes=minimum, scan_only=scan_only, sources=selected_sources,
                                   retry_sources=[s for s, variable in self.retry_vars.items() if variable.get()],
-                                  sources_by_filename=self.by_filename.get())
+                                  sources_by_filename=self.by_filename.get(),
+                                  browser_channel=BROWSER_OPTIONS[self.browser_choice.get()])
         self.worker.start()
         self.log('开始扫描本地文件' if scan_only else '开始网页自动流程：扫描 → 自动打开浏览器 → 搜索 → 点击下载 → 校验')
 
@@ -411,6 +437,8 @@ class PlaylistApp(tk.Tk):
                 kind = evt['kind']
                 if kind == 'message':
                     self.log(evt['text'])
+                elif kind == 'browser':
+                    self.browser_status.set('已启动浏览器：' + evt['name'])
                 elif kind == 'scan':
                     self.message.set(f'本地有效音频 {evt["count"]} 个；扫描警告 {len(evt["warnings"])} 条')
                     try:
@@ -440,7 +468,7 @@ class PlaylistApp(tk.Tk):
                     if track:
                         track.status, track.note = evt['status'], evt['note']
                         self.tree.item(track.uid, values=self.row_values(track))
-                        if track.status in ('失败', '待确认', '成功'):
+                        if track.status in ('失败', '待确认', '成功', '时长不足'):
                             self.log(f'{track.title} - {track.artist}：{track.status}；{track.note}')
                         dirty = True
                 elif kind == 'done':
@@ -450,7 +478,11 @@ class PlaylistApp(tk.Tk):
                     self.pause_button.configure(text='暂停')
                     for button in self.mutable_buttons:
                         button.state(['!disabled'])
-                    self.log('本轮已结束；请查看上方日志。浏览器保留供核对，停止或关闭程序时自动关闭。')
+                    if evt.get('interruption'):
+                        self.active_source.set('当前音源：已中断')
+                        self.log('本轮已中断：' + evt['interruption'])
+                    else:
+                        self.log('本轮已结束；请查看上方日志。浏览器仍开启时可供核对，停止或关闭程序时自动关闭。')
                     dirty = True
         except queue.Empty:
             pass
@@ -473,7 +505,7 @@ class PlaylistApp(tk.Tk):
         self.after(100, self.poll)
 
     def _data(self):
-        return dict(version=3, duplicates=self.duplicates, playlist_paths=self.playlist_paths,
+        return dict(browser_channel=BROWSER_OPTIONS[self.browser_choice.get()], version=3, duplicates=self.duplicates, playlist_paths=self.playlist_paths,
                     sources=[s for s,v in self.source_vars.items() if v.get()],
                     retry_sources=[s for s,v in self.retry_vars.items() if v.get()],
                     sources_by_filename=self.by_filename.get(), roots=[str(p) for p in self.roots],
@@ -508,6 +540,9 @@ class PlaylistApp(tk.Tk):
             track.uid = f'session-{i}'
             if track.status in ('搜索中', '下载中'):
                 track.status = '待处理'
+            if track.status == '失败' and 'Target page, context or browser has been closed' in track.note:
+                track.status = '待处理'
+                track.note = '上次浏览器关闭导致下载中断，已恢复待处理；重新开始即可重试'
         self.tracks = unique
         self.playlist_paths = list(data.get('playlist_paths', []))
         for track in unique:
@@ -519,10 +554,13 @@ class PlaylistApp(tk.Tk):
         for source, variable in self.retry_vars.items():
             variable.set(source in data.get('retry_sources', []))
         self.by_filename.set(bool(data.get('sources_by_filename', False)))
+        self.browser_choice.set(next((label for label, code in BROWSER_OPTIONS.items()
+                                      if code == data.get('browser_channel')), next(iter(BROWSER_OPTIONS))))
         self.duplicates = max(0, int(data.get('duplicates', 0))) + len(duplicates)
         self.roots = [Path(p) for p in data.get('roots', [])]
         self.destination.set(data.get('download_dir', self.destination.get()))
         self.minimum.set(str(data.get('minimum_kib', MIN_BYTES // 1024)))
+        mark_deleted_short(self.tracks, self.state_path.parent)
         self.refresh()
 
     def load_session(self):

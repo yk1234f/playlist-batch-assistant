@@ -23,13 +23,13 @@ from provider import JBSou, Candidate, ProviderError
 from policy_selftest import PolicyRegression
 
 
-def wav_bytes():
+def wav_bytes(seconds=90):
     stream = io.BytesIO()
     with wave.open(stream, 'wb') as f:
         f.setnchannels(1)
         f.setsampwidth(2)
         f.setframerate(16000)
-        f.writeframes(b'\0\0' * 16000 * 12)
+        f.writeframes(b'\0\0' * int(16000 * seconds))
     return stream.getvalue()
 
 
@@ -57,6 +57,9 @@ class Handler(BaseHTTPRequestHandler):
         body = self.server.audio
         content_type = 'audio/wav'
         declared = len(body)
+        if self.path == '/short':
+            body = wav_bytes(30)
+            declared = len(body)
         if self.path == '/html':
             body = b'<html>Error</html>' + b' ' * 400000
             content_type = 'audio/mpeg'
@@ -76,6 +79,30 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Regression(unittest.TestCase):
+    def test_browser_choices_only_installed_channels(self):
+        from browser_runtime import launch_choices
+        self.assertEqual(launch_choices(), [('Microsoft Edge', {'channel': 'msedge'}), ('Google Chrome', {'channel': 'chrome'})])
+        self.assertEqual(launch_choices('chrome'), [('Google Chrome', {'channel': 'chrome'})])
+        with self.assertRaises(ValueError):
+            launch_choices('bundled')
+
+    def test_missing_browsers_stop_with_install_instructions(self):
+        from unittest.mock import patch, MagicMock
+        from browser_provider import BrowserProvider, BrowserUnavailable
+        runtime = MagicMock()
+        runtime.chromium.launch_persistent_context.side_effect = RuntimeError('Executable missing')
+        provider = BrowserProvider(keep_open=False)
+        messages = []
+        provider.report = messages.append
+        with patch('playwright.sync_api.sync_playwright') as factory:
+            factory.return_value.start.return_value = runtime
+            with self.assertRaisesRegex(BrowserUnavailable, '请安装 Microsoft Edge'):
+                provider.start()
+        self.assertEqual(runtime.chromium.launch_persistent_context.call_count, 2)
+        runtime.stop.assert_called_once()
+        self.assertIsNone(provider.context)
+        self.assertTrue(any('正在启动 Microsoft Edge' in m for m in messages))
+
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -164,11 +191,95 @@ class Regression(unittest.TestCase):
 
     def test_valid_audio(self):
         info = validate_audio(self.audio('valid.wav'))
-        self.assertAlmostEqual(info.duration, 12)
+        self.assertAlmostEqual(info.duration, 90)
 
     def test_bad_extension(self):
         with self.assertRaises(ValueError):
             validate_audio(self.audio('bad.exe'))
+
+    def test_duration_boundary_and_short_download_cleanup(self):
+        from audio_files import ShortAudioError
+        path=self.root/'boundary.wav'
+        path.write_bytes(wav_bytes(89.999))
+        with self.assertRaises(ShortAudioError):validate_audio(path)
+        path.write_bytes(wav_bytes(90))
+        self.assertEqual(validate_audio(path).duration,90)
+        path.write_bytes(wav_bytes(.5))
+        with self.assertRaises(ShortAudioError):validate_audio(path)
+        path.unlink()
+        with self.assertRaises(ShortAudioError):
+            download_audio(self.provider,self.candidate('/short'),self.track,self.root)
+        self.assertFalse(list(self.root.iterdir()))
+
+    def test_short_cleanup_revalidates_and_remembers_mark(self):
+        from short_audio import find_short_audio,delete_short_audio,mark_deleted_short
+        short=self.root/'测试 (Live) - 歌手.wav'
+        full=self.root/'full.wav'
+        short.write_bytes(wav_bytes(30));full.write_bytes(wav_bytes(90))
+        (self.root/'bad.mp3').write_bytes(b'<html>bad</html>')
+        plan,errors=find_short_audio(self.root)
+        self.assertEqual(len(plan),1);self.assertTrue(errors)
+        short.write_bytes(wav_bytes(90))
+        deleted,errors=delete_short_audio(plan,self.root/'changed.jsonl')
+        self.assertFalse(deleted);self.assertTrue(errors)
+        short.write_bytes(wav_bytes(30))
+        deleted,errors=delete_short_audio(plan,self.root/'short-audio-test.jsonl')
+        self.assertEqual(deleted,[str(short)]);self.assertFalse(errors)
+        self.assertTrue(full.exists());self.assertTrue((self.root/'bad.mp3').exists())
+        mark_deleted_short([self.track],self.root)
+        self.assertEqual(self.track.status,'时长不足')
+        self.assertIn('已删除',self.track.note)
+        alias=Track('alias','不同标签','不同歌手',note=str(short))
+        mark_deleted_short([alias],self.root)
+        self.assertEqual(alias.status,'时长不足')
+
+    def test_short_candidate_metadata_skips_download(self):
+        from unittest.mock import Mock
+        provider=Mock()
+        c=self.candidate();c.duration=89.9
+        provider.search.return_value=[c]
+        events=queue.Queue()
+        worker=BatchWorker([self.track],[],self.root,events,provider=provider,sources=['qq'],interval=0)
+        worker.process(self.track,{})
+        provider.download.assert_not_called()
+        self.assertTrue(any(e.get('status')=='时长不足' for e in events.queue))
+
+    def test_local_short_is_marked_and_not_redownloaded(self):
+        from unittest.mock import Mock
+        (self.root/'测试 (Live) - 歌手.wav').write_bytes(wav_bytes(30))
+        provider=Mock(keep_open=False)
+        events=queue.Queue()
+        worker=BatchWorker([self.track],[self.root],self.root,events,provider=provider,sources=['qq'],interval=0)
+        worker.run()
+        provider.search.assert_not_called()
+        self.assertTrue(any(e.get('status')=='时长不足' for e in events.queue))
+
+    def test_short_dialog_deletes_and_marks_task(self):
+        from app import PlaylistApp
+        from duplicate_dialog import DuplicateDialog
+        from unittest.mock import patch
+        path=self.root/'测试 (Live) - 歌手.wav'
+        path.write_bytes(wav_bytes(30))
+        app=PlaylistApp(state_path=self.root/'short-session.json');app.withdraw()
+        app.destination.set(str(self.root));app.tracks=[self.track];app.refresh()
+        dialog=DuplicateDialog(app,short=True);dialog.withdraw()
+        def finish():
+            end=time.monotonic()+8
+            while dialog.busy and time.monotonic()<end:app.update();time.sleep(.02)
+            self.assertFalse(dialog.busy)
+        try:
+            dialog.scan();finish()
+            self.assertEqual(len(dialog.plan),1)
+            with patch('duplicate_dialog.messagebox.askyesno',return_value=True):dialog.delete()
+            finish()
+            self.assertFalse(path.exists());self.assertEqual(self.track.status,'时长不足')
+            app._load(app.state_path)
+            self.assertEqual(app.tracks[0].status,'时长不足')
+            self.assertIn('时长不足：1',app.stats.get())
+        finally:
+            with patch.object(app,'start'):dialog.close()
+            for job in app.tk.splitlist(app.tk.call('after','info')):app.after_cancel(job)
+            app.destroy()
 
     def test_fake_html_mp3(self):
         path = self.root / 'bad.mp3'
@@ -215,7 +326,7 @@ class Regression(unittest.TestCase):
         path, info = download_audio(self.provider, self.candidate(), self.track, self.root)
         self.assertEqual(path.suffix, '.wav')
         self.assertEqual(path.read_bytes(), self.server.audio)
-        self.assertEqual(info.duration, 12)
+        self.assertEqual(info.duration, 90)
         self.assertFalse(list(self.root.glob('*.part')))
 
     def test_no_overwrite(self):
@@ -338,13 +449,14 @@ class Regression(unittest.TestCase):
             self.assertEqual(len(editor.tree.get_children()), 0)
             editor.query.set('Live')
             self.assertEqual(len(editor.tree.get_children()), 1)
-            with patch('playlist_editor.messagebox.showinfo'):
+            with patch('playlist_editor.messagebox.showinfo'), patch.object(app, 'start') as scan:
                 editor.save()
+                scan.assert_called_once_with(True)
             self.assertEqual(app.tracks[0].title, '修改歌曲 (Live)')
             self.assertEqual(parse_file(path)[0].artist, '测试歌手')
             editor.tree.selection_set('1')
             editor.delete()
-            with patch('playlist_editor.messagebox.showinfo'):
+            with patch('playlist_editor.messagebox.showinfo'), patch.object(app, 'start'):
                 editor.save()
             self.assertEqual(app.tracks, [])
             self.assertTrue(list(self.root.glob('QQ-test.txt.before-edit-*.bak')))
@@ -352,6 +464,126 @@ class Regression(unittest.TestCase):
             editor.destroy()
             for job in app.tk.splitlist(app.tk.call('after', 'info')):
                 app.after_cancel(job)
+            app.destroy()
+
+    def test_exact_file_dedup_preserves_nonidentical_and_revalidates(self):
+        from library_duplicates import find_duplicates, delete_duplicates
+        original = self.root / 'original.wav'
+        copy = self.root / 'original (2).wav'
+        different = self.root / 'different.wav'
+        original.write_bytes(wav_bytes())
+        copy.write_bytes(original.read_bytes())
+        different.write_bytes(wav_bytes()[:-2] + b'\x01\x01')
+        plan, errors = find_duplicates(self.root)
+        self.assertFalse(errors)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]['delete'], str(copy))
+        copy.write_bytes(wav_bytes()[:-2] + b'\x02\x02')
+        deleted, errors = delete_duplicates(plan, self.root/'changed.jsonl')
+        self.assertFalse(deleted)
+        self.assertTrue(errors)
+        self.assertTrue(copy.exists())
+        copy.write_bytes(original.read_bytes())
+        deleted, errors = delete_duplicates(plan, self.root/'deleted.jsonl')
+        self.assertEqual(deleted, [str(copy)])
+        self.assertFalse(errors)
+        self.assertTrue(original.exists())
+        self.assertTrue(different.exists())
+
+    def test_dedup_rejects_outside_root_and_fake_audio(self):
+        from library_duplicates import find_duplicates, delete_duplicates
+        for name in ('a.mp3','b.mp3'):
+            (self.root/name).write_bytes(b'<html>not audio</html>')
+        plan, errors = find_duplicates(self.root)
+        self.assertFalse(plan)
+        self.assertTrue(errors)
+        nested = self.root/'nested'
+        nested.mkdir()
+        original = nested/'a.wav'
+        original.write_bytes(wav_bytes())
+        (nested/'b.wav').write_bytes(original.read_bytes())
+        plan, _ = find_duplicates(nested)
+        outside = self.root/'outside.wav'
+        outside.write_bytes(original.read_bytes())
+        plan[0]['delete'] = str(outside)
+        deleted, errors = delete_duplicates(plan,self.root/'outside.jsonl')
+        self.assertFalse(deleted)
+        self.assertTrue(errors)
+        self.assertTrue(outside.exists())
+
+    def test_local_matches_are_reported_before_first_search(self):
+        local = Track('local','本地歌曲','歌手')
+        (self.root/'本地歌曲 - 歌手.wav').write_bytes(wav_bytes())
+        events = queue.Queue()
+        worker = BatchWorker([self.track,local], [self.root], self.root, events,
+                             sources=['qq'],interval=0,provider=self.provider)
+        worker.start();worker.join(8)
+        history=list(events.queue)
+        mark=next(i for i,e in enumerate(history) if e.get('uid')=='local' and e.get('status')=='本地已有')
+        search=next(i for i,e in enumerate(history) if e.get('kind')=='current')
+        self.assertLess(mark,search)
+
+    def test_invalid_candidate_uses_next_exact_result_without_research(self):
+        from unittest.mock import Mock
+        provider=Mock()
+        wrong=Candidate('其他歌曲','歌手','wrong','qq','page')
+        first=Candidate(self.track.title,self.track.artist,'first','qq','page')
+        second=Candidate(self.track.title,self.track.artist,'second','qq','page')
+        provider.search.return_value=[first,wrong,second]
+        info=Mock(duration=12,size=400000)
+        provider.download.side_effect=[ValueError('文本错误'),(self.root/'ok.wav',info)]
+        events=queue.Queue()
+        worker=BatchWorker([self.track],[],self.root,events,sources=['qq','kugou'],retry_sources=['qq'],interval=0,provider=provider)
+        worker.process(self.track,{})
+        provider.search.assert_called_once_with(self.track.query,'qq')
+        self.assertEqual([call.args[0] for call in provider.download.call_args_list],[first,second])
+        self.assertTrue(any(e.get('status')=='成功' for e in events.queue))
+
+    def test_sync_scans_local_without_opening_browser(self):
+        from app import PlaylistApp
+        from unittest.mock import patch
+        path = self.root/'songs.txt'
+        path.write_text('本地歌曲 - 歌手\n',encoding='utf-8')
+        (self.root/'本地歌曲 - 歌手.wav').write_bytes(wav_bytes())
+        app=PlaylistApp(state_path=self.root/'sync.json')
+        app.withdraw()
+        try:
+            app.destination.set(str(self.root));app.roots=[self.root]
+            app.playlist_paths=[str(path)]
+            with patch('browser_provider.BrowserProvider.start') as browser:
+                app.reload_playlists()
+                app.worker.join(8)
+                app.poll()
+                self.assertEqual(app.tracks[0].status,'本地已有')
+                browser.assert_not_called()
+        finally:
+            for job in app.tk.splitlist(app.tk.call('after','info')):app.after_cancel(job)
+            app.destroy()
+
+    def test_duplicate_dialog_preview_and_delete(self):
+        from app import PlaylistApp
+        from duplicate_dialog import DuplicateDialog
+        from unittest.mock import patch
+        a=self.root/'a.wav';b=self.root/'a (2).wav'
+        a.write_bytes(wav_bytes());b.write_bytes(a.read_bytes())
+        app=PlaylistApp(state_path=self.root/'duplicate-gui.json');app.withdraw()
+        app.destination.set(str(self.root))
+        dialog=DuplicateDialog(app);dialog.withdraw()
+        def finish():
+            end=time.monotonic()+8
+            while dialog.busy and time.monotonic()<end:
+                app.update();time.sleep(.02)
+            self.assertFalse(dialog.busy)
+        try:
+            dialog.scan();finish()
+            self.assertEqual(len(dialog.tree.get_children()),1)
+            self.assertTrue(b.exists())
+            with patch('duplicate_dialog.messagebox.askyesno',return_value=True):dialog.delete()
+            finish()
+            self.assertTrue(a.exists());self.assertFalse(b.exists())
+        finally:
+            with patch.object(app,'start'):dialog.close()
+            for job in app.tk.splitlist(app.tk.call('after','info')):app.after_cancel(job)
             app.destroy()
 
     def test_tk_session_and_controls(self):
@@ -382,13 +614,23 @@ class Regression(unittest.TestCase):
             app.track_source.set('酷狗')
             app.set_track_source()
             self.assertEqual(app.tracks[0].music_source, 'kugou')
+            app.tracks[0].status = '失败'
+            app.tracks[0].note = 'qq 搜索已匹配，但下载失败：Download.save_as: Target page, context or browser has been closed'
+            app.autosave()
+            app._load(app.state_path)
+            self.assertEqual(app.tracks[0].status, '待处理')
             self.assertIn('酷狗', app.tree.item(app.tracks[0].uid, 'values')[1])
+            app.browser_choice.set('Google Chrome')
+            app.events.put(dict(kind='browser', name='Google Chrome'))
+            app.poll()
+            self.assertIn('Google Chrome', app.browser_status.get())
             app.retry_vars['qq'].set(True)
             app.by_filename.set(True)
             app.autosave()
             app._load(app.state_path)
             self.assertTrue(app.retry_vars['qq'].get())
             self.assertTrue(app.by_filename.get())
+            self.assertEqual(app.browser_choice.get(), 'Google Chrome')
             self.assertEqual(app.tracks[0].music_source, 'kugou')
         finally:
             for job in app.tk.splitlist(app.tk.call('after', 'info')):

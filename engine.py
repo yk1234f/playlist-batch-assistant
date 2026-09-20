@@ -4,7 +4,7 @@ import threading
 import time
 from pathlib import Path
 
-from audio_files import MIN_BYTES, scan_library, validate_audio
+from audio_files import MIN_BYTES, MIN_SECONDS, ShortAudioError, scan_library, validate_audio
 from matching import compare, identity
 from downloader import download_audio
 from provider import JBSou, SOURCES
@@ -23,7 +23,7 @@ class Skipped(Exception):
 class BatchWorker(threading.Thread):
     def __init__(self, tracks, roots, destination, events, *, sources=None,
                  min_bytes=MIN_BYTES, interval=2.0, provider=None, scan_only=False,
-                 retry_sources=(), sources_by_filename=False):
+                 retry_sources=(), sources_by_filename=False, browser_channel=None):
         super().__init__(daemon=True)
         self.tracks = tracks
         self.roots = list(dict.fromkeys([*roots, destination]))
@@ -34,7 +34,9 @@ class BatchWorker(threading.Thread):
         self.sources_by_filename = sources_by_filename
         self.min_bytes = min_bytes
         self.interval = interval
-        self.provider = provider or BrowserProvider()
+        self.provider = provider or BrowserProvider(channel=browser_channel)
+        if isinstance(self.provider, BrowserProvider):
+            self.provider.on_browser = lambda name: self.emit('browser', name=name)
         self.scan_only = scan_only
         self.resume_event = threading.Event()
         self.resume_event.set()
@@ -99,11 +101,27 @@ class BatchWorker(threading.Thread):
         self.last_request = time.monotonic()
 
     def run(self):
+        interruption = ''
         try:
             self.destination.mkdir(parents=True, exist_ok=True)
             self.emit('message', text='正在扫描本地音乐，读取标签并检查文件……')
-            index, warnings = scan_library(self.roots, self.min_bytes, self.checkpoint)
+            short_index = {}
+            index, warnings = scan_library(self.roots, self.min_bytes, self.checkpoint, short_index=short_index)
             self.emit('scan', warnings=warnings, count=len(set(index.values())))
+            # Publish all local matches before starting the first network search.
+            for track in self.tracks:
+                self.checkpoint()
+                local = index.get(identity(track.title, track.artist))
+                if local:
+                    self.emit('status', uid=track.uid, status='本地已有', note=str(local))
+                elif identity(track.title, track.artist) in short_index:
+                    path, duration = short_index[identity(track.title, track.artist)]
+                    track.status = '时长不足'
+                    self.emit('status', uid=track.uid, status='时长不足', note=f'本地音频 {duration:.3f} 秒 < 90 秒：{path}；可用“删除短音频”清理')
+                elif track.status in ('成功', '本地已有'):
+                    self.emit('status', uid=track.uid, status='待处理', note='本地文件缺失或校验失败，重新排队')
+            if self.scan_only:
+                return
             for track in self.tracks:
                 self.checkpoint()
                 key = identity(track.title, track.artist)
@@ -119,7 +137,7 @@ class BatchWorker(threading.Thread):
                     continue
                 if track.status in ('成功', '本地已有'):
                     self.emit('status', uid=track.uid, status='待处理', note='本地文件缺失或校验失败，重新排队')
-                if self.scan_only or track.status in ('跳过', '待确认', '失败'):
+                if self.scan_only or track.status in ('跳过', '待确认', '失败', '时长不足'):
                     continue
                 with self.control_lock:
                     self.skip_event.clear()
@@ -144,14 +162,18 @@ class BatchWorker(threading.Thread):
         except Cancelled:
             self.emit('message', text='已停止，未完成歌曲可以继续')
         except Exception as exc:
+            interruption = str(exc)
             self.emit('message', text=f'任务错误：{exc}')
         finally:
-            self.emit('done')
+            self.emit('done', interruption=interruption)
             try:
                 if getattr(self.provider, 'keep_open', False) and self.provider.page:
                     while not self.cancel_event.wait(.1) and not self.provider.page.is_closed():
-                        self.service_focus()
-                        self.provider.pump()
+                        try:
+                            self.service_focus()
+                            self.provider.pump()
+                        except BrowserUnavailable:
+                            break
             finally:
                 if hasattr(self.provider, 'close'):
                     self.provider.close()
@@ -181,6 +203,8 @@ class BatchWorker(threading.Thread):
                 self.report(f'音源 {source} 没有候选，按已勾选策略继续')
             ranked = sorted([(compare(track.title, track.artist, c.title, c.artist), c)
                              for c in candidates], key=lambda item: item[0].score, reverse=True)
+            matched_download_error = None
+            short_error = None
             for match, candidate in ranked:
                 if best is None or match.score > best[0].score:
                     best = match, candidate
@@ -189,6 +213,13 @@ class BatchWorker(threading.Thread):
                               page=candidate.page_url)
                 if not match.automatic:
                     continue
+                if 0 < candidate.duration < MIN_SECONDS:
+                    short_error = str(ShortAudioError(candidate.duration))
+                    self.report(short_error + '；已跳过该候选，无需下载')
+                    continue
+                self.emit('match', uid=track.uid, title=match.title, artist=match.artist,
+                          version=match.version, candidate=f'{candidate.title} - {candidate.artist}',
+                          page=candidate.page_url)
                 self.report(f'已找到精确匹配，停止其他音源和二次搜索：{source}')
                 self.emit('status', uid=track.uid, status='下载中', note=f'{source}: {candidate.title}')
                 self.pace()
@@ -201,6 +232,14 @@ class BatchWorker(threading.Thread):
                                                     self.checkpoint, self.min_bytes)
                 except (Cancelled, Skipped, BrowserUnavailable):
                     raise
+                except ShortAudioError as exc:
+                    short_error = str(exc)
+                    self.report(short_error + '；临时文件已删除，不重试短片段')
+                    continue
+                except ValueError as exc:
+                    matched_download_error = str(exc)
+                    self.report(f'当前精确候选下载无效：{exc}；检查同次搜索中的其他精确候选，不重新搜索音源')
+                    continue
                 except Exception as exc:
                     self.emit('status', uid=track.uid, status='失败',
                               note=f'{source} 搜索已匹配，但下载失败：{exc}；本首停止搜索，可更换音源后重试')
@@ -208,6 +247,14 @@ class BatchWorker(threading.Thread):
                 index[identity(track.title, track.artist)] = path
                 self.emit('status', uid=track.uid, status='成功', note=str(path),
                           duration=info.duration, size=info.size)
+                return
+            if short_error is not None:
+                self.emit('status', uid=track.uid, status='时长不足',
+                          note=short_error + ('；其他精确候选下载失败：' + matched_download_error if matched_download_error else ''))
+                return
+            if matched_download_error is not None:
+                self.emit('status', uid=track.uid, status='失败',
+                          note=f'{source} 搜索已匹配，但同次搜索的精确候选下载均无效：{matched_download_error}；未搜索其他音源')
                 return
         status = '待确认' if best else '失败'
         note = '候选歌名/歌手/版本不完全一致，请核对' if best else '所选音源未找到匹配歌曲'
